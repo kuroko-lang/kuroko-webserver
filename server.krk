@@ -1,0 +1,160 @@
+import kuroko
+import socket
+import os
+
+from mainloop import AsyncMainloop, Task, sleep, Future
+
+let server_version = f'kuroko/{kuroko.version}'
+let mainloop = None
+let request_count = 0
+
+class Client:
+    def __init__(conn, remote):
+        self.remote = remote
+        self.conn = conn
+        self.buf_off = 0
+        self.buf = b''
+
+    async def recv():
+        let future = Future()
+        mainloop.register(self.conn.fileno(), future.set_result, None)
+        await future
+        mainloop.unregister(self.conn.fileno())
+        return self.conn.recv(1024)
+
+
+    async def readline():
+        let o = b''
+        while True:
+            let c = await self.getc()
+            o += bytes((c,))
+            if c == ord('\n'):
+                return o
+
+    async def getc():
+        while True:
+            while self.buf and self.buf_off < len(self.buf):
+                let o = self.buf[self.buf_off]
+                self.buf_off += 1
+                if self.buf_off == len(self.buf):
+                    self.buf = b''
+                    self.buf_off = 0
+                return o
+
+            self.buf_off = 0
+            self.buf = await self.recv()
+            if len(self.buf) == 0:
+                raise ValueError('eof')
+
+    def respond(status, data, contentType='text/plain', statusMsg=''):
+        let asbytes = data.encode()
+        self.conn.send(
+            f'HTTP/1.1 {status}{" " if statusMsg else ""}{statusMsg}\r\n'
+            f'Server: {server_version}\r\n'
+            f'Content-Type: {contentType}\r\n'
+            f'Content-Length: {len(asbytes)}\r\n'
+            '\r\n'.encode())
+        self.conn.send(asbytes)
+        self.conn.send(b'\r\n')
+
+def with_ordinal(number):
+    let s = str(number)
+    if s[-2:] in ['11','12','13','14','15','16','17','18','19']:
+        return str(number) + 'th'
+    if s[-1] == '1': return str(number) + 'st'
+    if s[-1] == '2': return str(number) + 'nd'
+    if s[-1] == '3': return str(number) + 'rd'
+    return str(number) + 'th'
+
+async def handle_int(conn, remote):
+    let c = Client(conn, remote)
+
+    while True:
+        # Collect headers
+        let headers = []
+        while True:
+            try:
+                let next = await c.readline()
+                if next == b'\r\n':
+                    break
+                headers.append(next)
+            except ValueError:
+                return
+            except socket.SocketError:
+                return
+        if not headers:
+            raise ValueError('empty request')
+
+        # Pull off the first entry as the request command
+        let request = headers.pop(0)
+        request = request.decode().strip()
+
+        # Expect this to be METHOD PATH VERSION
+        let components = request.split()
+        if len(components) < 3:
+            raise ValueError('Too few elements')
+
+        # Now we can actually handle requests.
+        if components[0] == 'GET':
+            print(remote, "GET", components[1])
+            if components[1] in ['/', '/index.htm']:
+                c.respond(200,f'''<!doctype html>
+<html>
+<head>
+<title>hello world</title>
+</head>
+<body>
+<h1>hello, world</h1>
+<p>This is the {with_ordinal(request_count += 1)} request to this server.</p>
+<p><pre>{server_version}</pre></p>
+</body>
+</html>''',contentType='text/html',statusMsg='OK')
+            else:
+                c.respond(404,'File not found.',statusMsg='File not found.')
+
+        # TODO handle post content
+        # TODO handle... timeouts?
+
+async def handle(conn, remote):
+    '''Handle one connection. Closes the socket on an exception or when the other end hangs up.'''
+    try:
+        await handle_int(conn, remote)
+    except BaseException as e:
+        print(remote, "Exception", e)
+    os.close(conn.fileno())
+
+def __main__():
+    mainloop = AsyncMainloop()
+    let serversock = socket.socket()
+    serversock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    serversock.bind(('', 8080))
+    serversock.listen(50)
+
+    def accept(_):
+        try:
+            let c, remote = serversock.accept()
+            Task(handle(c,remote))
+        except BaseException as e:
+            print("Bad accept call?", e)
+
+    mainloop.register(serversock.fileno(), accept)
+    mainloop.run()
+    print("Mainloop exited?")
+
+    '''
+    while True:
+        let c, remote = serversock.accept()
+        # XXX: This is temporary; really need to implement all of this as an async event loop...
+        if os.fork() == 0:
+            try:
+                handle(c,remote)
+            except:
+                print(remote, "Exception while handling request.")
+        else:
+            os.close(c.fileno())
+    '''
+
+
+
+if __name__ == '__main__':
+    return __main__()

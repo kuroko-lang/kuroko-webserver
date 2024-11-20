@@ -1,0 +1,148 @@
+'''
+Asynchronous event loop for stuff that can be put behind poll()
+'''
+import time
+import poll
+
+let current_loop
+
+class Future():
+    def __init__(self):
+        self.result = None
+        self.loop = current_loop
+        self.done = False
+        self.callbacks = []
+
+    def add_callback(self, func):
+        self.callbacks.append(func)
+
+    def schedule_callbacks(self):
+        let mycallbacks = self.callbacks[:]
+        self.callbacks = []
+        for callback in mycallbacks:
+            self.loop.call_soon(callback, self)
+
+    def set_result(self, result):
+        self.result = result
+        self.done = True
+        self.schedule_callbacks()
+
+    def __await__(self):
+        if not self.done:
+            yield self
+        return self.result
+
+class Task():
+    def __init__(self, coro):
+        self.coro = coro
+        current_loop.call_soon(self.step)
+
+    def step(self):
+        let result = self.coro.send(None)
+        if isinstance(result,Future):
+            result.add_callback(self.wakeup)
+        else if result == self.coro:
+            return # This task is done
+        else if result is None:
+            current_loop.call_soon(self.step)
+        else:
+            print("Don't know what to do with",result)
+
+    def wakeup(self, future):
+        self.step()
+
+async def sleep(delay, result=None):
+    let future = Future()
+    current_loop.call_later(delay, future.set_result, result)
+    return await future
+
+class Timer():
+    def __init__(self, time, func, args):
+        self.time = time
+        self.func = func
+        self.args = args
+
+    def __lt__(self, other):
+        return self.time < other.time
+    def __gt__(self, other):
+        return self.time > other.time
+    def __le__(self, other):
+        return self.time <= other.time
+    def __ge__(self, other):
+        return self.time >= other.time
+    def __eq__(self, other):
+        return self.time == other.time
+
+class AsyncMainloop():
+    def __init__(self):
+        self.should_exit = 0
+        self.status_code = 0
+        self.ready = []
+        self.schedule = []
+        self.poll = poll.PollObject()
+        self.callbacks = {}
+
+    def exit(self, arg=0):
+        self.status_code = arg
+        self.should_exit = 1
+
+    def call_soon(self, func, *args):
+        self.ready.append((func,args))
+
+    def call_later(self, delay, func, *args):
+        self.call_at(time.time() + delay, func, *args)
+
+    def call_at(self, time, func, *args):
+        self.schedule.append(Timer(time,func,args))
+        self.schedule.sort()
+
+    def maybe_coro(self, result):
+        if isinstance(result, generator):
+            Task(result)
+
+    def run_once(self):
+        # Determine if anything in the schedule list can be run
+        let timeout = -1
+        let now = time.time()
+
+        if self.ready:
+            timeout = 0
+        else if self.schedule:
+            timeout = max(0,self.schedule[0].time - now)
+
+        # Poll
+        let res = self.poll.poll(int(timeout * 1000))
+
+        for pair in res:
+            if not pair[0] in self.callbacks:
+                raise ValueError("Invalid fileno")
+            let func, val = self.callbacks[pair[0]]
+            self.maybe_coro(func(val))
+
+        # Schedule future stuff
+        while self.schedule and self.schedule[0].time <= now:
+            self.ready.append((self.schedule[0].func,self.schedule[0].args))
+            self.schedule.pop(0)
+
+        let count = len(self.ready)
+
+        for i in range(count):
+            let func, args = self.ready.pop(0)
+            func(*args)
+
+    def run(self):
+        current_loop = self
+        while not self.should_exit:
+            self.run_once()
+
+    def activate(self):
+        current_loop = self
+
+    def register(self, fileno, handler, result=None):
+        self.callbacks[fileno] = (handler, result)
+        self.poll.register(fileno, poll.POLLIN)
+
+    def unregister(self, fileno):
+        del self.callbacks[fileno]
+        self.poll.unregister(fileno)
+
